@@ -43,6 +43,12 @@
 
 #![allow(unused_variables, dead_code)]
 
+use std::collections::HashSet;
+use rand::{distributions::Alphanumeric, Rng};
+use url::Url as baseUrl;
+
+const SLUG_LEN: usize = 10;
+
 /// All possible errors of the [`UrlShortenerService`].
 #[derive(Debug, PartialEq)]
 pub enum ShortenerError {
@@ -132,13 +138,17 @@ pub mod queries {
 
 /// CQRS and Event Sourcing-based service implementation
 pub struct UrlShortenerService {
-    // TODO: add needed fields
+    url_events: Vec<ShortLink>,
+    stat_events: Vec<Slug>
 }
 
 impl UrlShortenerService {
     /// Creates a new instance of the service
     pub fn new() -> Self {
-        Self {}
+        Self {
+            url_events: Vec::new(),
+            stat_events: Vec::new(),
+        }
     }
 }
 
@@ -148,20 +158,76 @@ impl commands::CommandHandler for UrlShortenerService {
         url: Url,
         slug: Option<Slug>,
     ) -> Result<ShortLink, ShortenerError> {
-        todo!("Implement the logic for creating a short link")
+        if let Err(_) = baseUrl::parse(&url.0) {
+            return Err(ShortenerError::InvalidUrl);
+        }
+        
+        // We need to process all created slugs and make sure that our new slug doesn't match any of existing slugs
+        // Let's create HashSet to make O(1) complexity of slug existance check
+        let mut collected_slugs = HashSet::new();
+        for url_event in &self.url_events {
+            collected_slugs.insert(&url_event.slug.0);
+        }
+        
+        let short_link: ShortLink;
+        match slug {
+            Some(slug) => {
+                if collected_slugs.contains(&slug.0) {
+                    return Err(ShortenerError::SlugAlreadyInUse);
+                }
+                short_link = ShortLink{slug, url};
+            },
+            None => {
+                loop {
+                    // We will try to generate random slug until it is not present in system yet
+                    let slug_str: String = rand::thread_rng().sample_iter(Alphanumeric).take(SLUG_LEN).map(char::from).collect();
+                    if !collected_slugs.contains(&slug_str) {
+                        short_link = ShortLink{slug: Slug(slug_str), url};
+                        break;
+                    }
+                };
+            }
+        }
+
+        // Create event for new slug
+        self.url_events.push(short_link.clone());
+
+        return Ok(short_link);
     }
 
     fn handle_redirect(
         &mut self,
         slug: Slug,
     ) -> Result<ShortLink, ShortenerError> {
-        todo!("Implement the logic for redirection and incrementing the click counter")
+        // Check all link creation events to figure out if slug exists or not
+        for url_event in &self.url_events {
+            if url_event.slug == slug {
+                self.stat_events.push(slug.clone());
+                return Ok(ShortLink{url: url_event.url.clone(), slug})
+            }
+        }
+
+        return Err(ShortenerError::SlugNotFound);
     }
 }
 
 impl queries::QueryHandler for UrlShortenerService {
     fn get_stats(&self, slug: Slug) -> Result<Stats, ShortenerError> {
-        todo!("Implement the logic for retrieving link statistics")
+        // Check all link creation events to figure out if slug exists or not
+        for url_event in &self.url_events {
+            if url_event.slug == slug {
+                // Ok, we found registered slug, now we have to count all redirects for this slug
+                let mut redirects: u64 = 0;
+                for stat_event in &self.stat_events {
+                    if stat_event.0 == slug.0 {
+                        redirects += 1;
+                    }
+                }
+                return Ok(Stats{link: url_event.clone(), redirects})
+            }
+        }
+
+        return Err(ShortenerError::SlugNotFound);
     }
 }
 
