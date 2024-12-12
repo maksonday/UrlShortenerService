@@ -155,7 +155,7 @@ impl UrlShortenerService {
         }
     }
 
-    pub fn log(&self, message: String) {
+    fn log(&self, message: String) {
         let now = Local::now().format("%Y-%m-%d %H:%M:%S");
         println!("[{}] {message}", now);
     }
