@@ -43,10 +43,9 @@
 
 #![allow(unused_variables, dead_code)]
 
-use std::collections::{HashSet, HashMap};
+use std::{collections::{HashMap, HashSet}, hash::{DefaultHasher, Hash, Hasher}};
 use commands::CommandHandler;
 use queries::QueryHandler;
-use rand::{distributions::Alphanumeric, Rng};
 use url::Url as baseUrl;
 use chrono::Local;
 
@@ -168,37 +167,47 @@ impl commands::CommandHandler for UrlShortenerService {
         url: Url,
         slug: Option<Slug>,
     ) -> Result<ShortLink, ShortenerError> {
-        if let Err(_) = baseUrl::parse(&url.0) {
+        if baseUrl::parse(&url.0).is_err() {
             return Err(ShortenerError::InvalidUrl);
         }
         
         // We need to process all created slugs and make sure that our new slug doesn't match any of existing slugs
-        // Let's create HashSet to make O(1) complexity of slug existance check
-        let mut collected_slugs = HashSet::new();
-        for url_event in &self.url_events {
-            collected_slugs.insert(&url_event.slug.0);
+        // It is equal to finding out if we already processed url because we can have only one slug for url
+        if self.url_events.iter().any(|event| event.url == url) {
+            self.log(format!("Failed to create short link: URL {url:?} already exists"));
+            return Err(ShortenerError::SlugAlreadyInUse);
         }
+
+        // Collect all slugs in HashSet to provide existance of slug check O(1)
+        let existing_slugs: HashSet<_> = self.url_events.iter().map(|event| &event.slug.0).collect();
         
-        let short_link: ShortLink;
-        match slug {
+        // Function that generates slug using hash of url
+        fn generate_slug_from_url(url: &str) -> String {
+            let mut hasher = DefaultHasher::new();
+            url.hash(&mut hasher);
+            let hash = hasher.finish();
+        
+            format!("{:x}", hash).chars().take(SLUG_LEN).collect()
+        }
+
+        let short_link = match slug {
             Some(slug) => {
-                if collected_slugs.contains(&slug.0) {
+                if existing_slugs.contains(&slug.0) {
                     self.log(format!("Failed to create short link: slug {slug:?} is already in use"));
                     return Err(ShortenerError::SlugAlreadyInUse);
                 }
-                short_link = ShortLink{slug, url};
+                ShortLink { slug: slug, url }
             },
             None => {
+                // We will try to create random slug that doesn't exist yet
                 loop {
-                    // We will try to generate random slug until it is not present in system yet
-                    let slug_str: String = rand::thread_rng().sample_iter(Alphanumeric).take(SLUG_LEN).map(char::from).collect();
-                    if !collected_slugs.contains(&slug_str) {
-                        short_link = ShortLink{slug: Slug(slug_str), url};
-                        break;
+                    let slug_str = generate_slug_from_url(&url.0);
+                    if !existing_slugs.contains(&slug_str) {
+                        break ShortLink { slug: Slug(slug_str), url };
                     }
-                };
+                }                
             }
-        }
+        };
 
         // Create event for new slug
         self.url_events.push(short_link.clone());
@@ -210,46 +219,44 @@ impl commands::CommandHandler for UrlShortenerService {
         &mut self,
         slug: Slug,
     ) -> Result<ShortLink, ShortenerError> {
-        // Check all link creation events to figure out if slug exists or not
-        for url_event in &self.url_events {
-            if url_event.slug == slug {
-                // Create event of redirect by slug
-                match self.redirect_events_by_slug.get_mut(&slug.0) {
-                    Some(stat) => stat.push(slug.clone()),
-                    None => {
-                        self.redirect_events_by_slug.insert(slug.0.clone(), vec![slug.clone()]);
-                    },
-                }
-                self.log(format!("Handled redirect of slug {slug:?}"));
-                return Ok(ShortLink{url: url_event.url.clone(), slug});
+        // Check if slug exists via iterating over url_events
+        if let Some(url_event) = self.url_events.iter().find(|url_event| url_event.slug == slug) {
+            // Ok, we found it, create redirect event
+            if let Some(stat) = self.redirect_events_by_slug.get_mut(&slug.0) {
+                stat.push(slug.clone());
+            } else {
+                self.redirect_events_by_slug.insert(slug.0.clone(), vec![slug.clone()]);
             }
+
+            self.log(format!("Handled redirect of slug {slug:?}"));
+
+            return Ok(ShortLink {
+                url: url_event.url.clone(),
+                slug,
+            });
         }
 
         self.log(format!("Failed to handle redirect of slug {slug:?}: slug not found"));
-        return Err(ShortenerError::SlugNotFound);
+        Err(ShortenerError::SlugNotFound)
     }
 }
 
 impl queries::QueryHandler for UrlShortenerService {
     fn get_stats(&self, slug: Slug) -> Result<Stats, ShortenerError> {
         // Check all link creation events to figure out if slug exists or not
-        for url_event in &self.url_events {
-            if url_event.slug == slug {
-                // Ok, we found registered slug, now we have to count all redirects for this slug
-                let mut redirects: u64 = 0;
-                match self.redirect_events_by_slug.get(&slug.0) {
-                    Some(stat) => redirects = stat.iter().filter(|&x| x.0 == slug.0).count() as u64,
-                    None => (),
-                }
-                let stats = Stats{link: url_event.clone(), redirects};
-                self.log(format!("Retrieved stats {stats:?}"));
-                
-                return Ok(stats);
-            }
+        if let Some(url_event) = self.url_events.iter().find(|url_event| url_event.slug == slug) {
+            // Ok, we found registered slug, now we have to count all redirects for this slug
+            let redirects = self.redirect_events_by_slug.get(&slug.0)
+                .map_or(0, |stat| stat.iter().filter(|&x| x.0 == slug.0).count()) as u64;
+
+            let stats = Stats{link: url_event.clone(), redirects};
+            self.log(format!("Retrieved stats {stats:?}"));
+            
+            return Ok(stats);
         }
 
         self.log(format!("Failed to retrieve stat of slug {slug:?}: slug not found"));
-        return Err(ShortenerError::SlugNotFound);
+        Err(ShortenerError::SlugNotFound)
     }
 }
 
@@ -257,24 +264,36 @@ fn main() {
     // Create service instance
     let mut service: UrlShortenerService = UrlShortenerService::new();
     let test_url = Url(String::from("http://relap.io/amazing-receipts-worldwide"));
-    let test_slug = None;
 
     // Test link creation with no predefined slug - OK
-    let short_link = match service.handle_create_short_link(test_url.clone(), test_slug){
+    let short_link = match service.handle_create_short_link(test_url.clone(), None){
         Ok(short_link) => short_link,
-        Err(error) => panic!("Failed to create short link for url {:?} with no predefined slug: {:?}", test_url, error)
+        Err(error) => panic!("Failed to create short link for url {:?} with no predefined slug: {:?}", test_url, error),
     };
 
-    let test_url = Url(String::from("http://relap.io/amazing-receipts-worldwide"));
+    // Test link creation for the same url - FAIL, our urls are unique because slug is made from url and unique!
+    match service.handle_create_short_link(test_url.clone(), None){
+        Ok(_) => panic!("Something went wrong, we cannot create slug for url that was already registered in system"),
+        Err(error) => assert_eq!(error, ShortenerError::SlugAlreadyInUse),
+    };
+
+    let test_url = Url(String::from("http://relap.io/amazing-receipts-worldwide1"));
     let test_slug = Some(Slug(String::from("random_slug")));
+
     // Test link creation with predefined slug - OK
     let short_link_with_slug = match service.handle_create_short_link(test_url.clone(), test_slug.clone()){
         Ok(short_link) => short_link,
-        Err(error) => panic!("Failed to create short link for url {:?} with predefined slug {:?}: {:?}", test_url, test_slug.unwrap(), error)
+        Err(error) => panic!("Failed to create short link for url {:?} with predefined slug {:?}: {:?}", test_url, test_slug.unwrap(), error),
     };
 
     // Test link creation with predefined slug - FAIL, because we already have this slug!
-    match service.handle_create_short_link(test_url.clone(), test_slug.clone()){
+    match service.handle_create_short_link(Url(String::from("http://relap.io/amazing-receipts-worldwide2")), test_slug.clone()){
+        Ok(_) => panic!("Something went wrong, we should have this slug {:?} saved!", test_slug.unwrap()),
+        Err(error) => assert_eq!(error, ShortenerError::SlugAlreadyInUse),
+    };
+
+    // Test link creation with predefined slug - FAIL, because we already have this url registered!
+    match service.handle_create_short_link(test_url.clone(), Some(Slug(String::from("something")))) {
         Ok(_) => panic!("Something went wrong, we should have this slug {:?} saved!", test_slug.unwrap()),
         Err(error) => assert_eq!(error, ShortenerError::SlugAlreadyInUse),
     };
