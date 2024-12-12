@@ -213,12 +213,9 @@ impl commands::CommandHandler for UrlShortenerService {
         // Check all link creation events to figure out if slug exists or not
         for url_event in &self.url_events {
             if url_event.slug == slug {
-                let stat = self.redirect_events_by_slug.get_mut(&slug.0);
                 // Create event of redirect by slug
-                match stat {
-                    Some(stat) => {
-                        stat.push(slug.clone());
-                    },
+                match self.redirect_events_by_slug.get_mut(&slug.0) {
+                    Some(stat) => stat.push(slug.clone()),
                     None => {
                         self.redirect_events_by_slug.insert(slug.0.clone(), vec![slug.clone()]);
                     },
@@ -240,16 +237,9 @@ impl queries::QueryHandler for UrlShortenerService {
             if url_event.slug == slug {
                 // Ok, we found registered slug, now we have to count all redirects for this slug
                 let mut redirects: u64 = 0;
-                let stat = self.redirect_events_by_slug.get(&slug.0);
-                match stat {
-                    Some(stat) => {
-                        for stat_event in stat {
-                            if stat_event.0 == slug.0 {
-                                redirects += 1;
-                            }
-                        }
-                    },
-                    None => {},
+                match self.redirect_events_by_slug.get(&slug.0) {
+                    Some(stat) => redirects = stat.iter().filter(|&x| x.0 == slug.0).count() as u64,
+                    None => (),
                 }
                 let stats = Stats{link: url_event.clone(), redirects};
                 self.log(format!("Retrieved stats {stats:?}"));
