@@ -43,7 +43,9 @@
 
 #![allow(unused_variables, dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use commands::CommandHandler;
+use queries::QueryHandler;
 use rand::{distributions::Alphanumeric, Rng};
 use url::Url as baseUrl;
 
@@ -138,8 +140,10 @@ pub mod queries {
 
 /// CQRS and Event Sourcing-based service implementation
 pub struct UrlShortenerService {
-    url_events: Vec<ShortLink>,
-    stat_events: Vec<Slug>
+    // store slug creation events as vector
+    url_events: Vec<ShortLink>, 
+    // store redirect events as hashmap of vectors to split events by slugs, we can do it because all slugs are unique, so we can speed up process of calculating stats
+    redirect_events_by_slug: HashMap<String, Vec<Slug>>
 }
 
 impl UrlShortenerService {
@@ -147,7 +151,7 @@ impl UrlShortenerService {
     pub fn new() -> Self {
         Self {
             url_events: Vec::new(),
-            stat_events: Vec::new(),
+            redirect_events_by_slug: HashMap::new(),
         }
     }
 }
@@ -191,6 +195,7 @@ impl commands::CommandHandler for UrlShortenerService {
 
         // Create event for new slug
         self.url_events.push(short_link.clone());
+        println!("Successfully created short link {short_link:?}"); // do some logging
 
         return Ok(short_link);
     }
@@ -202,8 +207,19 @@ impl commands::CommandHandler for UrlShortenerService {
         // Check all link creation events to figure out if slug exists or not
         for url_event in &self.url_events {
             if url_event.slug == slug {
-                self.stat_events.push(slug.clone());
-                return Ok(ShortLink{url: url_event.url.clone(), slug})
+                let stat = self.redirect_events_by_slug.get_mut(&slug.0);
+                // Create event of redirect by slug
+                match stat {
+                    Some(stat) => {
+                        stat.push(slug.clone());
+                    },
+                    None => {
+                        self.redirect_events_by_slug.insert(slug.0.clone(), vec![slug.clone()]);
+                    },
+                }
+                println!("Handled redirect of slug {slug:?}"); // do some logging
+
+                return Ok(ShortLink{url: url_event.url.clone(), slug});
             }
         }
 
@@ -218,12 +234,21 @@ impl queries::QueryHandler for UrlShortenerService {
             if url_event.slug == slug {
                 // Ok, we found registered slug, now we have to count all redirects for this slug
                 let mut redirects: u64 = 0;
-                for stat_event in &self.stat_events {
-                    if stat_event.0 == slug.0 {
-                        redirects += 1;
-                    }
+                let stat = self.redirect_events_by_slug.get(&slug.0);
+                match stat {
+                    Some(stat) => {
+                        for stat_event in stat {
+                            if stat_event.0 == slug.0 {
+                                redirects += 1;
+                            }
+                        }
+                    },
+                    None => {},
                 }
-                return Ok(Stats{link: url_event.clone(), redirects})
+                let stats = Stats{link: url_event.clone(), redirects};
+                println!("Retrieved stats {stats:?}"); // do some logging
+                
+                return Ok(stats);
             }
         }
 
@@ -232,4 +257,51 @@ impl queries::QueryHandler for UrlShortenerService {
 }
 
 fn main() {
+    // Create service instance
+    let mut service: UrlShortenerService = UrlShortenerService::new();
+    let test_url = Url(String::from("http://relap.io/amazing-receipts-worldwide"));
+    let test_slug = None;
+
+    // Test link creation with no predefined slug - OK
+    let short_link = match service.handle_create_short_link(test_url.clone(), test_slug){
+        Ok(short_link) => short_link,
+        Err(error) => panic!("failed to create short link for url {:?} with no predefined slug: {:?}", test_url, error)
+    };
+
+    let test_url = Url(String::from("http://relap.io/amazing-receipts-worldwide"));
+    let test_slug = Some(Slug(String::from("random_slug")));
+    // Test link creation with predefined slug - OK
+    let short_link_with_slug = match service.handle_create_short_link(test_url.clone(), test_slug.clone()){
+        Ok(short_link) => short_link,
+        Err(error) => panic!("failed to create short link for url {:?} with predefined slug {:?}: {:?}", test_url, test_slug.unwrap(), error)
+    };
+
+    // Test link creation with predefined slug - FAIL, because we already have this slug!
+    match service.handle_create_short_link(test_url.clone(), test_slug.clone()){
+        Ok(_) => panic!("something went wrong, we should have this slug {:?} saved!", test_slug.unwrap()),
+        Err(error) => assert_eq!(error, ShortenerError::SlugAlreadyInUse),
+    };
+
+    // Do some redirects for short_link
+    let short_link_redirects_count = 10;
+    for _ in 0..short_link_redirects_count {
+        match service.handle_redirect(short_link.slug.clone()) {
+            Ok(link) => assert_eq!(link, short_link),
+            Err(error) => panic!("failed to process redirect of short link {:?}: {:?}!", short_link.slug, error),
+        }
+    }
+
+    // Test retrieving stats for short_link
+    match service.get_stats(short_link.slug.clone()) {
+        Ok(stats) => assert_eq!(stats.redirects, short_link_redirects_count),
+        Err(error) => panic!("something went wrong while receiving stats for short link {:?}: {:?}", short_link, error),
+    }
+
+    // Test retrieving stats for short_link, that doesn't exist
+    match service.get_stats(Slug(String::from("random_slug_1"))) {
+        Ok(_) => panic!("we shoudn't receive stats for slug that doesn't exist!"),
+        Err(error) => assert_eq!(error, ShortenerError::SlugNotFound),
+    }
+
+    println!("Yay! We did it!");
 }
